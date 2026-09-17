@@ -192,54 +192,33 @@ enum PredictionResult {
     Tie,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct TeamObservation {
     match_id: String,
-    queued_side: Vec<SteamID>,
     result: PredictionResult,
-    current_overlap: usize,
-    historical_configured_count: usize,
-    configured_outside_count: usize,
-    unconfigured_count: usize,
-    historical_roster: Vec<SteamID>,
-    weight: usize,
+    queued_players: usize,
+    weight: f64,
     game_finished_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct TeamObservationKey {
-    match_id: String,
-    queued_side: Vec<SteamID>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct PredictionStats {
-    // Composition-weighted totals used by the lineup-aware estimate.
+    weighted_score: f64,
+    total_weight: f64,
     wins: usize,
     losses: usize,
-    // Unweighted totals for the deduplicated historical team observations.
-    observed_wins: usize,
-    observed_losses: usize,
-    observed_ties: usize,
-    unique_observations: usize,
+    ties: usize,
     unique_matches: usize,
 }
 
-fn observation_weight(
-    current_queue_size: usize,
-    current_overlap: usize,
-    historical_configured_count: usize,
-) -> usize {
-    let context_score =
-        QUEUE_SIZE.saturating_sub(historical_configured_count.abs_diff(current_queue_size));
-    current_overlap * context_score
-}
+fn match_weight(queued_players: usize, team_score: u32, opponent_score: u32) -> f64 {
+    let rounds_played = team_score + opponent_score;
+    let round_total_weight = 1.0 - (rounds_played as f64 - 13.0) / 34.0;
+    let round_difference_weight = 0.5 + team_score.abs_diff(opponent_score) as f64 / 26.0;
 
-#[cfg(test)]
-fn select_recent_games(
-    games: &[services::leetify::LeetifyGame],
-) -> Vec<services::leetify::LeetifyGame> {
-    select_recent_games_with_limit(games, services::leetify::RECENT_MATCHES_LIMIT)
+    queued_players as f64 / QUEUE_SIZE as f64
+        * round_total_weight
+        * round_difference_weight
 }
 
 fn select_recent_games_with_limit(
@@ -250,166 +229,6 @@ fn select_recent_games_with_limit(
     selected.sort_by_key(|game| std::cmp::Reverse(game.game_finished_at));
     selected.truncate(match_count);
     selected
-}
-
-fn queued_side_sort_key(side: &[SteamID]) -> String {
-    side.iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-#[cfg(test)]
-fn test_hydrated_matches(
-    histories: &HashMap<SteamID, Vec<services::leetify::LeetifyGame>>,
-) -> HashMap<String, services::leetify::LeetifyMatch> {
-    let mut games_by_id = HashMap::<String, Vec<services::leetify::LeetifyGame>>::new();
-    for games in histories.values() {
-        for game in games {
-            if let Some(match_id) = game.id.clone() {
-                games_by_id.entry(match_id).or_default().push(game.clone());
-            }
-        }
-    }
-
-    games_by_id
-        .into_iter()
-        .filter_map(|(match_id, games)| {
-            let reference = games.first()?.clone();
-            let mut sides = Vec::<services::leetify::LeetifyGame>::new();
-
-            for game in games {
-                let mut roster = game.own_team_steam64_ids.clone();
-                roster.sort_by_key(ToString::to_string);
-                roster.dedup();
-
-                if let Some(existing) = sides.iter_mut().find(|existing| {
-                    let mut existing_roster = existing.own_team_steam64_ids.clone();
-                    existing_roster.sort_by_key(ToString::to_string);
-                    existing_roster.dedup();
-                    roster.iter().all(|id| existing_roster.contains(id))
-                        || existing_roster.iter().all(|id| roster.contains(id))
-                }) {
-                    if existing.match_result != game.match_result
-                        || existing.game_finished_at != game.game_finished_at
-                        || existing.map_name != game.map_name
-                        || existing.scores != game.scores
-                    {
-                        return None;
-                    }
-                    if roster.len() > existing.own_team_steam64_ids.len() {
-                        *existing = game;
-                    }
-                } else {
-                    sides.push(game);
-                }
-            }
-
-            if sides.len() > 2 {
-                return None;
-            }
-            if sides.len() == 2
-                && (sides[0].scores.0 != sides[1].scores.1
-                    || sides[0].scores.1 != sides[1].scores.0)
-            {
-                return None;
-            }
-
-            let mut teams = sides
-                .iter()
-                .enumerate()
-                .map(|(side_index, side)| {
-                    let mut steam64_ids = side.own_team_steam64_ids.clone();
-                    steam64_ids.sort_by_key(ToString::to_string);
-                    steam64_ids.dedup();
-                    while steam64_ids.len() < QUEUE_SIZE {
-                        steam64_ids.push(SteamID::new(format!(
-                            "test-filler-{match_id}-{side_index}-{}",
-                            steam64_ids.len()
-                        )));
-                    }
-                    services::leetify::LeetifyMatchTeam {
-                        steam64_ids,
-                        score: side.scores.0,
-                    }
-                })
-                .collect::<Vec<_>>();
-
-            if teams.len() == 1 {
-                teams.push(services::leetify::LeetifyMatchTeam {
-                    steam64_ids: (0..QUEUE_SIZE)
-                        .map(|index| SteamID::new(format!("test-opponent-{match_id}-{index}")))
-                        .collect(),
-                    score: reference.scores.1,
-                });
-            }
-
-            Some((
-                match_id.clone(),
-                services::leetify::LeetifyMatch {
-                    id: match_id,
-                    game_finished_at: reference.game_finished_at,
-                    map_name: reference.map_name.clone(),
-                    teams,
-                },
-            ))
-        })
-        .collect()
-}
-
-#[cfg(test)]
-fn build_team_observations(
-    queue_steam_ids: &[SteamID],
-    histories: &HashMap<SteamID, Vec<services::leetify::LeetifyGame>>,
-) -> Vec<TeamObservation> {
-    let configured_steam_ids = queue_steam_ids.iter().cloned().collect();
-    build_team_observations_with_configured(
-        queue_steam_ids.len(),
-        queue_steam_ids,
-        &configured_steam_ids,
-        histories,
-    )
-}
-
-#[cfg(test)]
-fn build_team_observations_with_configured(
-    current_queue_size: usize,
-    queue_steam_ids: &[SteamID],
-    configured_steam_ids: &HashSet<SteamID>,
-    histories: &HashMap<SteamID, Vec<services::leetify::LeetifyGame>>,
-) -> Vec<TeamObservation> {
-    let candidate_match_ids = select_candidate_match_ids(
-        queue_steam_ids,
-        histories,
-        services::leetify::RECENT_MATCHES_LIMIT,
-    );
-    let hydrated_matches = test_hydrated_matches(histories);
-    build_team_observations_from_matches(
-        current_queue_size,
-        queue_steam_ids,
-        configured_steam_ids,
-        &candidate_match_ids,
-        &hydrated_matches,
-    )
-}
-
-#[cfg(test)]
-fn build_team_observations_with_limit(
-    current_queue_size: usize,
-    queue_steam_ids: &[SteamID],
-    configured_steam_ids: &HashSet<SteamID>,
-    histories: &HashMap<SteamID, Vec<services::leetify::LeetifyGame>>,
-    match_count: usize,
-) -> Vec<TeamObservation> {
-    let candidate_match_ids = select_candidate_match_ids(queue_steam_ids, histories, match_count);
-    let hydrated_matches = test_hydrated_matches(histories);
-    build_team_observations_from_matches(
-        current_queue_size,
-        queue_steam_ids,
-        configured_steam_ids,
-        &candidate_match_ids,
-        &hydrated_matches,
-    )
 }
 
 /// Select the union of match IDs from each queued player's newest match
@@ -443,46 +262,58 @@ fn select_candidate_match_ids(
     candidate_match_ids
 }
 
-/// Build one observation per `(match_id, queued_side)` from hydrated match
-/// details. The profile-history windows only select candidate IDs; complete
-/// historical sides determine lineup overlap and configured-player context.
-/// A queued player can therefore contribute to overlap even when their own
-/// history did not select or could not fetch that match.
+/// Build one observation per hydrated match. The profile-history windows only
+/// select candidate IDs; hydrated matches provide the complete team rosters.
 fn build_team_observations_from_matches(
-    current_queue_size: usize,
     queue_steam_ids: &[SteamID],
-    configured_steam_ids: &HashSet<SteamID>,
     candidate_match_ids: &HashSet<String>,
     hydrated_matches: &HashMap<String, services::leetify::LeetifyMatch>,
 ) -> Vec<TeamObservation> {
     let queue_steam_ids: HashSet<SteamID> = queue_steam_ids.iter().cloned().collect();
-    let mut candidates: HashMap<TeamObservationKey, Vec<TeamObservation>> = HashMap::new();
     let mut sorted_match_ids = candidate_match_ids.iter().collect::<Vec<_>>();
     sorted_match_ids.sort();
 
-    for match_id in sorted_match_ids {
-        let Some(game) = hydrated_matches.get(match_id) else {
-            continue;
-        };
-        if game.id != *match_id || game.map_name.is_empty() || game.teams.len() != 2 {
-            continue;
-        }
+    sorted_match_ids
+        .into_iter()
+        .filter_map(|match_id| {
+            let game = hydrated_matches.get(match_id)?;
+            if game.id != *match_id || game.map_name.is_empty() || game.teams.len() != 2 {
+                return None;
+            }
 
-        let all_players = game
-            .teams
-            .iter()
-            .flat_map(|team| team.steam64_ids.iter())
-            .collect::<HashSet<_>>();
-        if game
-            .teams
-            .iter()
-            .any(|team| team.steam64_ids.len() != QUEUE_SIZE)
-            || all_players.len() != QUEUE_SIZE * 2
-        {
-            continue;
-        }
+            let all_players = game
+                .teams
+                .iter()
+                .flat_map(|team| team.steam64_ids.iter())
+                .collect::<HashSet<_>>();
+            if game
+                .teams
+                .iter()
+                .any(|team| team.steam64_ids.len() != QUEUE_SIZE)
+                || all_players.len() != QUEUE_SIZE * 2
+            {
+                return None;
+            }
 
-        for (team_index, team) in game.teams.iter().enumerate() {
+            let (team_index, queued_players) = game
+                .teams
+                .iter()
+                .enumerate()
+                .map(|(index, team)| {
+                    (
+                        index,
+                        team.steam64_ids
+                            .iter()
+                            .filter(|steam_id| queue_steam_ids.contains(*steam_id))
+                            .count(),
+                    )
+                })
+                .max_by_key(|(_, queued_players)| *queued_players)?;
+            if queued_players < 2 {
+                return None;
+            }
+
+            let team = &game.teams[team_index];
             let opponent = &game.teams[1 - team_index];
             let result = match team.score.cmp(&opponent.score) {
                 Ordering::Greater => PredictionResult::Win,
@@ -490,106 +321,45 @@ fn build_team_observations_from_matches(
                 Ordering::Equal => PredictionResult::Tie,
             };
 
-            let mut historical_roster = team.steam64_ids.clone();
-            historical_roster.sort_by_key(ToString::to_string);
-            historical_roster.dedup();
-
-            let mut queued_side = historical_roster
-                .iter()
-                .filter(|steam_id| queue_steam_ids.contains(*steam_id))
-                .cloned()
-                .collect::<Vec<_>>();
-            queued_side.sort_by_key(ToString::to_string);
-            if queued_side.is_empty() {
-                continue;
-            }
-
-            let key = TeamObservationKey {
+            Some(TeamObservation {
                 match_id: game.id.clone(),
-                queued_side: queued_side.clone(),
-            };
-            let current_overlap = key.queued_side.len();
-            let historical_configured_count = historical_roster
-                .iter()
-                .filter(|steam_id| configured_steam_ids.contains(*steam_id))
-                .count();
-            let configured_outside_count =
-                historical_configured_count.saturating_sub(current_overlap);
-            let unconfigured_count = historical_roster
-                .len()
-                .saturating_sub(historical_configured_count);
-            candidates.entry(key).or_default().push(TeamObservation {
-                match_id: game.id.clone(),
-                queued_side,
                 result,
-                current_overlap,
-                historical_configured_count,
-                configured_outside_count,
-                unconfigured_count,
-                historical_roster,
-                weight: observation_weight(
-                    current_queue_size,
-                    current_overlap,
-                    historical_configured_count,
-                ),
+                queued_players,
+                weight: match_weight(queued_players, team.score, opponent.score),
                 game_finished_at: game.game_finished_at,
-            });
-        }
-    }
-
-    let mut observations = candidates
-        .into_values()
-        .filter_map(|candidates| {
-            let reference = candidates.first()?;
-            candidates
-                .iter()
-                .all(|candidate| candidate == reference)
-                .then(|| reference.clone())
-        })
-        .collect::<Vec<_>>();
-
-    observations.sort_by(|left, right| {
-        left.match_id
-            .cmp(&right.match_id)
-            .then_with(|| {
-                queued_side_sort_key(&left.queued_side)
-                    .cmp(&queued_side_sort_key(&right.queued_side))
             })
-            .then_with(|| left.game_finished_at.cmp(&right.game_finished_at))
-    });
-    observations
+        })
+        .collect()
 }
 
 fn aggregate_prediction(observations: &[TeamObservation]) -> Option<PredictionStats> {
     let mut stats = PredictionStats::default();
-    let mut unique_matches = HashSet::new();
 
     for observation in observations {
+        stats.total_weight += observation.weight;
         match observation.result {
             PredictionResult::Win => {
-                stats.observed_wins += 1;
-                stats.wins += observation.weight;
+                stats.wins += 1;
+                stats.weighted_score += observation.weight;
             }
             PredictionResult::Loss => {
-                stats.observed_losses += 1;
-                stats.losses += observation.weight;
+                stats.losses += 1;
             }
             PredictionResult::Tie => {
-                stats.observed_ties += 1;
-                continue;
+                stats.ties += 1;
+                stats.weighted_score += observation.weight / 2.0;
             }
         }
-
-        stats.unique_observations += 1;
-        unique_matches.insert(observation.match_id.clone());
     }
 
-    if stats.wins + stats.losses == 0 {
-        return None;
-    }
-
-    stats.unique_matches = unique_matches.len();
-    Some(stats)
+    (stats.total_weight > 0.0).then(|| {
+        stats.unique_matches = observations
+            .iter()
+            .map(|observation| observation.match_id.as_str())
+            .collect::<HashSet<_>>()
+            .len();
+        stats
+    })
 }
 
 fn has_failed_hydration(
@@ -601,12 +371,8 @@ fn has_failed_hydration(
         .any(|match_id| failed_match_ids.contains(match_id))
 }
 
-fn win_percentage(wins: usize, losses: usize) -> f32 {
-    if wins + losses == 0 {
-        0.0
-    } else {
-        wins as f32 / (wins + losses) as f32 * 100.0
-    }
+fn predicted_percentage(stats: PredictionStats) -> f64 {
+    stats.weighted_score / stats.total_weight * 100.0
 }
 
 fn format_prediction_line(
@@ -615,6 +381,7 @@ fn format_prediction_line(
     player_count: usize,
     available_histories: usize,
     stats: Option<PredictionStats>,
+    hydration_incomplete: bool,
 ) -> String {
     let coverage = if available_histories < player_count {
         format!(" · {available_histories}/{player_count} histories available")
@@ -622,19 +389,36 @@ fn format_prediction_line(
         String::new()
     };
 
+    if player_count == 1 {
+        return format!(
+            "- <b>{queue_id}</b> · <b>{player_count}/{queue_size} players</b>{coverage}\n  glhf"
+        );
+    }
+
     match stats {
-        None => format!(
-            "- <b>{queue_id}</b> · <b>{player_count}/{queue_size} players</b>{coverage}\n  Prediction unavailable"
-        ),
+        None => {
+            let warning = if hydration_incomplete {
+                "\n  <i>Warning: some match information could not be fetched; this may be incorrect.</i>"
+            } else {
+                ""
+            };
+            format!(
+                "- <b>{queue_id}</b> · <b>{player_count}/{queue_size} players</b>{coverage}\n  Prediction unavailable{warning}"
+            )
+        }
         Some(stats) => {
-            let observed_win_percentage = win_percentage(stats.observed_wins, stats.observed_losses);
-            let lineup_aware_win_percentage = win_percentage(stats.wins, stats.losses);
+            let warning = if hydration_incomplete {
+                "\n  <i>Warning: some match information could not be fetched; this may be incorrect.</i>"
+            } else {
+                ""
+            };
 
             format!(
-                "- <b>{queue_id}</b> · <b>{player_count}/{queue_size} players</b>{coverage}\n  <b>Recent results:</b> {}W / {}L / {}T ({observed_win_percentage:.0}%)\n  <b>Predicted win rate:</b> {lineup_aware_win_percentage:.0}%",
-                stats.observed_wins,
-                stats.observed_losses,
-                stats.observed_ties,
+                "- <b>{queue_id}</b> · <b>{player_count}/{queue_size} players</b>{coverage}\n  <b>Recent results:</b> {}W / {}L / {}T\n  <b>Predicted win rate:</b> {:.0}%{warning}",
+                stats.wins,
+                stats.losses,
+                stats.ties,
+                predicted_percentage(stats),
             )
         }
     }
@@ -743,13 +527,6 @@ pub async fn predictions(
 
     let steam_ids = player_steam_ids.values().cloned().collect();
     let histories = fetch_prediction_histories(settings, steam_ids).await;
-    let configured_steam_ids = settings
-        .players
-        .steamid_mappings
-        .values()
-        .cloned()
-        .collect::<HashSet<_>>();
-
     let queue_prediction_inputs = queues
         .iter()
         .map(|(_, queue)| {
@@ -777,9 +554,7 @@ pub async fn predictions(
             |((queue_id, queue), (queue_steam_ids, candidate_match_ids))| {
                 let players = queue.get_players().0;
                 let observations = build_team_observations_from_matches(
-                    players.len(),
                     queue_steam_ids,
-                    &configured_steam_ids,
                     candidate_match_ids,
                     &hydration.matches,
                 );
@@ -792,17 +567,16 @@ pub async fn predictions(
                     })
                     .count();
 
-                let stats = if has_failed_hydration(
+                let hydration_incomplete = has_failed_hydration(
                     candidate_match_ids,
                     &hydration.failed_match_ids,
-                ) {
+                );
+                if hydration_incomplete {
                     eprintln!(
-                        "Prediction for queue {queue_id} unavailable because match hydration was incomplete"
+                        "Prediction for queue {queue_id} is based on incomplete match hydration"
                     );
-                    None
-                } else {
-                    aggregate_prediction(&observations)
-                };
+                }
+                let stats = aggregate_prediction(&observations);
 
                 format_prediction_line(
                     queue_id,
@@ -810,6 +584,7 @@ pub async fn predictions(
                     players.len(),
                     available_histories,
                     stats,
+                    hydration_incomplete,
                 )
             },
         )
@@ -823,6 +598,123 @@ pub async fn predictions(
 }
 
 #[cfg(test)]
+mod prediction_tests {
+    use super::*;
+
+    fn steam_id(id: &str) -> SteamID {
+        SteamID::new(id.to_string())
+    }
+
+    fn hydrated_match(
+        id: &str,
+        first_team: &[&str],
+        first_score: u32,
+        second_team: &[&str],
+        second_score: u32,
+    ) -> services::leetify::LeetifyMatch {
+        services::leetify::LeetifyMatch {
+            id: id.to_string(),
+            game_finished_at: Utc::now(),
+            map_name: "de_nuke".to_string(),
+            teams: vec![
+                services::leetify::LeetifyMatchTeam {
+                    steam64_ids: first_team.iter().map(|id| steam_id(id)).collect(),
+                    score: first_score,
+                },
+                services::leetify::LeetifyMatchTeam {
+                    steam64_ids: second_team.iter().map(|id| steam_id(id)).collect(),
+                    score: second_score,
+                },
+            ],
+        }
+    }
+
+    fn observation(
+        match_id: &str,
+        result: PredictionResult,
+        weight: f64,
+    ) -> TeamObservation {
+        TeamObservation {
+            match_id: match_id.to_string(),
+            result,
+            queued_players: 2,
+            weight,
+            game_finished_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn match_weight_uses_round_total_and_difference() {
+        assert!((match_weight(5, 13, 0) - 1.0).abs() < f64::EPSILON);
+        assert!((match_weight(5, 15, 15) - 0.25).abs() < f64::EPSILON);
+        assert!((match_weight(2, 13, 9) - (2.0 / 5.0 * 25.0 / 34.0 * 17.0 / 26.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn each_hydrated_match_produces_one_observation() {
+        let queue = vec![steam_id("A"), steam_id("B"), steam_id("C")];
+        let candidate_ids = HashSet::from(["match".to_string()]);
+        let matches = HashMap::from([(
+            "match".to_string(),
+            hydrated_match(
+                "match",
+                &["A", "B", "outside-1", "outside-2", "outside-3"],
+                13,
+                &["C", "enemy-1", "enemy-2", "enemy-3", "enemy-4"],
+                0,
+            ),
+        )]);
+
+        let observations = build_team_observations_from_matches(&queue, &candidate_ids, &matches);
+
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].queued_players, 2);
+        assert_eq!(observations[0].result, PredictionResult::Win);
+    }
+
+    #[test]
+    fn prediction_uses_ties_as_half_a_win() {
+        let stats = aggregate_prediction(&[
+            observation("win", PredictionResult::Win, 1.0),
+            observation("tie", PredictionResult::Tie, 1.0),
+            observation("loss", PredictionResult::Loss, 1.0),
+        ])
+        .unwrap();
+
+        assert_eq!((stats.wins, stats.losses, stats.ties), (1, 1, 1));
+        assert!((predicted_percentage(stats) - 50.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn one_player_queue_says_glhf() {
+        let line = format_prediction_line(
+            &QueueId::new("20:15".to_string()),
+            5,
+            1,
+            1,
+            None,
+            false,
+        );
+        assert!(line.ends_with("glhf"));
+    }
+
+    #[test]
+    fn incomplete_hydration_keeps_results_and_warns() {
+        let line = format_prediction_line(
+            &QueueId::new("20:15".to_string()),
+            5,
+            2,
+            2,
+            aggregate_prediction(&[observation("win", PredictionResult::Win, 1.0)]),
+            true,
+        );
+
+        assert!(line.contains("100%"));
+        assert!(line.contains("some match information could not be fetched"));
+    }
+}
+
+#[cfg(any())]
 mod tests {
     use super::*;
     use chrono::{Duration, TimeZone};
